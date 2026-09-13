@@ -1,0 +1,21 @@
+# =============================================================================
+# full_scale.yaml — restores the full experimental sweep on top of base.yaml.
+#
+# Usage:
+#     from src.utils.config import load_config
+#     cfg = load_config("configs/base.yaml", overrides="configs/full_scale.yaml")
+#
+# Safe to switch to at any time after the reduced first pass (base.yaml's
+# seeds=[0], agent_counts=[3]) has validated the pipeline end-to-end —
+# this only ADDS work (new seeds, new agent count), it never invalidates
+# anything already computed. Checkpoint resume (src/utils/checkpoint.py)
+# means re-running scripts/01_build_pools.py and scripts/02_run_debates.py
+# with this override skips everything already done and only computes the
+# newly-added seed/agent-count combinations.
+# =============================================================================
+
+project:
+  seeds: [0, 1, 2, 3]
+
+debate:
+  agent_counts: [3, 5]
