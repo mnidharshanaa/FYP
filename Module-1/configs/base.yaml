@@ -1,0 +1,202 @@
+# =============================================================================
+# base.yaml — Master experiment configuration.
+#
+# Nothing in src/ should ever hardcode a dataset path, model name, seed,
+# or hyperparameter. Everything that could plausibly change between runs
+# or ablations lives here. Scripts load this via src/utils/config.py.
+# =============================================================================
+
+project:
+  name: "digra-rag-memory"
+  # Root for all persisted artifacts. On Kaggle this should point at
+  # /kaggle/working/ (session-local) with periodic sync to a Kaggle Dataset
+  # (persistent across sessions) — see src/utils/checkpoint.py.
+  output_root: "results"
+  seeds: [0]                   # reduced from [0,1,2,3] for a first full end-to-end
+                                # validation pass (see configs/full_scale.yaml to restore
+                                # all 4 seeds later — safe to do any time, since already-
+                                # completed seed=0 debates/pools are unaffected and reused
+                                # via checkpoint resume, this only adds new work, never
+                                # invalidates old work)
+
+# -----------------------------------------------------------------------------
+# Periodic backup during long-running Kaggle jobs (scripts/01_build_pools.py,
+# scripts/02_run_debates.py). See src/utils/backup.py's module docstring for
+# the important distinction between local_dest (a same-session safety net,
+# NOT protection against session/kernel loss) and kaggle_dataset_slug (real
+# off-session persistence, requires `kaggle` CLI + API credentials configured).
+# -----------------------------------------------------------------------------
+backup:
+  every_n_questions: 10        # 0 disables backup entirely
+  local_dest: "/kaggle/working/backup"     # ignored if not running on Kaggle-shaped paths
+  kaggle_dataset_slug: null    # e.g. "yourusername/digra-project-results" once created
+
+# -----------------------------------------------------------------------------
+# Models under test. `hf_id` must match a HuggingFace repo you have access to.
+# `role` distinguishes the debate-generation model from the (optional, cheaper)
+# entropy-estimation proxy model discussed in Appendix C-3 of the DIGRA paper.
+#
+# Serving params (dtype/max_model_len/gpu_memory_utilization/
+# tensor_parallel_size) below are tuned for Kaggle's T4 GPUs, confirmed via
+# scripts/smoke_test_vllm.py on a dual-T4 session:
+#   - dtype "float16" not "bfloat16": T4 (Turing) has no native bfloat16
+#     tensor-core support; bfloat16 falls back to slow emulation there.
+#   - max_model_len 3072: raised from an initial 2048 after a real Kaggle
+#     failure (see generation.max_tokens comment below for the root cause).
+#     A dual-T4 session's own log showed ~14.36GiB free per device with
+#     only ~9.3GiB actually used at max_model_len=2048, so there is real
+#     headroom for this increase — confirmed empirically, not guessed.
+#     Re-verify via smoke_test_vllm.py if you change GPU type/count.
+#   - tensor_parallel_size 2: assumes a dual-T4 Kaggle session. Set to 1 on
+#     a single-GPU session.
+# -----------------------------------------------------------------------------
+models:
+  llama:
+    hf_id: "meta-llama/Llama-3.1-8B-Instruct"
+    role: "debate"
+    dtype: "float16"
+    max_model_len: 3072
+    gpu_memory_utilization: 0.80
+    tensor_parallel_size: 2
+  mistral:
+    hf_id: "mistralai/Mistral-7B-Instruct-v0.3"
+    role: "debate"
+    dtype: "float16"
+    max_model_len: 3072
+    gpu_memory_utilization: 0.80
+    tensor_parallel_size: 2
+  entropy_proxy: null            # e.g. a smaller model id if using a cheaper
+                                  # proxy for entropy estimation; null = use
+                                  # the debate model itself for entropy too
+
+# -----------------------------------------------------------------------------
+# Datasets — populated by scripts/00_fetch_farm.py into data.farm_dir below.
+# Schema verified directly against the live repo (src/data/farm_schema.py,
+# tests/test_farm_schema.py), not assumed from the paper/README alone.
+#
+# IMPORTANT: FARM ships NQ1 (488) and NQ2 (489) as separate subsets — they
+# differ only in how the seeded incorrect "adv.target" was generated (NQ2's
+# target is the LLM's own "easy misselection" from the mcq, NQ1's is a
+# direct negation). The DIGRA paper reports a single "NQ" — src/data/
+# farm_loader.py's load_dataset("nq", ...) pools NQ1+NQ2 together to match
+# that reporting. This is a documented reproduction choice, revisit if
+# NQ1-only vs NQ2-only results diverge meaningfully in practice.
+# -----------------------------------------------------------------------------
+data:
+  farm_dir: "data/farm"          # where scripts/00_fetch_farm.py stages the .jsonl files
+
+datasets:
+  nq:
+    farm_subsets: ["nq1", "nq2"]   # pooled — see note above
+    n_questions: 30                # cut down after a lost Kaggle session — see README "Lessons"
+  boolq:
+    farm_subsets: ["boolq"]
+    n_questions: 30
+  truthfulqa:
+    farm_subsets: ["truthfulqa"]
+    n_questions: 30
+
+# -----------------------------------------------------------------------------
+# Debate mechanics
+# -----------------------------------------------------------------------------
+debate:
+  agent_counts: [3]            # reduced from [3,5] for a first pass — the
+                                # hallucination_setups below are defined for
+                                # n_agents=3 (matching the paper's Table I); see
+                                # configs/full_scale.yaml to add n_agents=5 later
+  # Caps how many of the already-pool-built questions actually get debated,
+  # WITHOUT changing datasets.*.n_questions (which would pick a different
+  # random subsample and orphan already-completed pool-building work — see
+  # src/agents/orchestration.py's apply_debate_question_cap). null = debate
+  # every pool-built question. Set to e.g. 30 for a fast first debate pass
+  # on a subset of questions you've already built pools for.
+  max_questions_per_dataset: null
+  n_rounds: 3
+  hallucination_setups:          # (n_incorrect, n_correct) at round 1, for agent_count=3
+    - [3, 0]                     # lower bound
+    - [2, 1]
+    - [1, 2]
+    - [0, 3]                     # upper bound (faithfulness-hallucination probe)
+    - "standard"                 # genuine fresh round-1 generation, no seeding
+  correct_pool_size: 5           # N_all in Appendix B-3
+  correct_pool_sampling_attempts: 50
+
+generation:
+  # 1024 (the paper's Table V value) is oversized for this pipeline's
+  # short-answer QA format ("...Final answer: X") AND is directly what
+  # caused a real Kaggle failure: pool_generation.py's guided/few-shot
+  # prompt (Appendix B-3 step 3) embeds prior generations as examples, so
+  # a few 1024-token examples plus the question/gold-answer scaffolding
+  # pushed a request past max_model_len=2048 on question nq2_0478 during
+  # the first real pool-building run. Capped here at 300 — comfortably
+  # enough for reasoning + a final-answer line on these tasks — with
+  # src/data/prompts.py's max_examples cap (3) as a second, independent
+  # safety margin against the same failure mode.
+  max_tokens: 300
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 50
+  logprobs_topk: 20              # top-k logprobs requested per token, for entropy
+
+# -----------------------------------------------------------------------------
+# DIGRA core
+# -----------------------------------------------------------------------------
+digra:
+  alpha: 0.2                     # balance parameter, eq. (8)
+  max_partner_set_size: null     # null = unrestricted; set e.g. 2 for Fig. 8(c)-style runs
+  early_stopping:
+    consensus_required: true
+    unchanged_rounds_threshold: 2
+
+# -----------------------------------------------------------------------------
+# RAG correction module (novelty component 1)
+# -----------------------------------------------------------------------------
+rag:
+  enabled: true
+  retriever: "bm25"               # "bm25" | "dense" — see src/rag/retriever.py
+  corpus:
+    nq: "wikipedia_dump"
+    boolq: "boolq_native_passages"   # BoolQ ships its own gold passage — use it directly
+    truthfulqa: "wikipedia_dump"     # weaker fit; documented as a known limitation
+  top_k_passages: 5
+  contradiction_detector: "nli"      # "nli" | "llm_judge"
+  nli_model: "roberta-large-mnli"
+  contradiction_threshold: 0.5       # NLI "contradiction" probability above which we flag
+  entropy_inflation_factor: 2.0      # multiplicative penalty applied to H(R_j) in IGR denom
+
+# -----------------------------------------------------------------------------
+# Memory / trust module (novelty component 2)
+# -----------------------------------------------------------------------------
+memory:
+  enabled: true
+  initial_trust: 1.0
+  flag_penalty: 0.3               # trust multiplier applied on a RAG contradiction flag
+  consistency_reward: 0.05        # additive trust recovery per round without a flag
+  min_trust: 0.1
+  trust_weight_in_igr: 1.0        # exponent/weight applied to trust when folded into IGR
+
+# -----------------------------------------------------------------------------
+# Baselines to run for Table II-style comparison
+# -----------------------------------------------------------------------------
+baselines:
+  - cot
+  - cot_sc5
+  - mad_standard
+  - mad_sparse_half
+  - mad_random
+  - dig                            # IG-only ablation (no entropy normalization)
+  - digra
+  - digra_rag                      # + evidence-adjusted IGR
+  - digra_rag_memory               # + persistent trust score
+
+# -----------------------------------------------------------------------------
+# CoT-SC baseline (Module 1). "cot" and "cot_sc5" above are both produced by
+# ONE generation pass per question at n_samples_max, sliced down to every k
+# in sc_ks — see src/baselines/cot_sc.py's module docstring. k=1 IS the "cot"
+# row (single sample, no self-consistency); k=5 IS "cot_sc5" (the DIGRA
+# paper's own CoT-SC(5) baseline, Table II). The extra k's give the
+# accuracy-vs-sampling-count sweep (paper's Fig. 5) for free.
+# -----------------------------------------------------------------------------
+cot_sc:
+  n_samples_max: 10                # generate this many fresh samples per question
+  sc_ks: [1, 3, 5, 10]             # which sample counts to compute a vote/metrics for
