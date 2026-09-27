@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.env.*
+
+# Hugging Face / model caches
+.cache/
+huggingface/
+transformers_cache/
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Generated experiment outputs
+# Uncomment if results should NOT be committed:
+# results/
+
+# OS
+.DS_Store
+Thumbs.db
